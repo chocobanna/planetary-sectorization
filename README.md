@@ -1,2 +1,2 @@
-# planetary-sectorization
-A planet scale simulation using many sectors.
+# Planetary Sectorization
+A simulation of planetary sectors.
