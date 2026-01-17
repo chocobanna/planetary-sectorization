@@ -5,3 +5,6 @@ A simulation of planetary sectors.
 - Spherical Voronoi Diagram
 - Efficient simulation <10k cells realtime
 - ...
+
+# Sources
+- https://www.jasondavies.com/maps/voronoi/
