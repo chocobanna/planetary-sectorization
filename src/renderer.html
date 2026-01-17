@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Spherical Voronoi (WebGL1) - Orbit + Lloyd</title>
+  <style>
+    html,body{margin:0;height:100%;background:#0b0e14;color:#e6e6e6;font-family:system-ui,sans-serif}
+    canvas{display:block;width:100%;height:100%}
+    .ui{
+      position:fixed;left:12px;top:12px;z-index:10;
+      background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);
+      border-radius:12px;padding:10px 12px;backdrop-filter: blur(6px);
+      font-size:12px;line-height:1.35
+    }
+    .row{display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap}
+    input[type="range"]{width:220px}
+    .hint{opacity:.85;margin-top:6px;max-width:540px}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
+    .err{
+      position:fixed;left:12px;right:12px;bottom:12px;z-index:9999;
+      background:rgba(140,20,20,.85);border:1px solid rgba(255,255,255,.15);
+      color:#fff;padding:10px 12px;border-radius:12px;white-space:pre-wrap;
+      font:12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      max-height:40vh;overflow:auto;
+    }
+    button{cursor:pointer}
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="ui">
+  <div><b>Spherical Voronoi</b> (WebGL1)</div>
+
+  <div class="row">
+    <label>Cells: <span id="nVal" class="mono">96</span></label>
+    <input id="n" type="range" min="4" max="256" step="1" value="96" />
+  </div>
+
+  <div class="row">
+    <label>Line: <span id="wVal" class="mono">0.0030</span></label>
+    <input id="w" type="range" min="0.0005" max="0.02" step="0.0005" value="0.003" />
+  </div>
+
+  <div class="row">
+    <label>Render scale: <span id="sVal" class="mono">0.75</span></label>
+    <input id="scale" type="range" min="0.35" max="1.0" step="0.05" value="0.75" />
+  </div>
+
+  <div class="row">
+    <label>Lloyd iters: <span id="lVal" class="mono">3</span></label>
+    <input id="lloyd" type="range" min="0" max="12" step="1" value="3" />
+  </div>
+
+  <div class="row">
+    <button id="regen">Randomize + relax</button>
+    <label class="row" style="gap:6px;margin:0">
+      <input id="edges" type="checkbox" checked /> show edges
+    </label>
+  </div>
+
+  <div class="hint">
+    Drag to orbit • Wheel to zoom • Main perf knob = <b>Render scale</b>.<br>
+    Lloyd relaxation runs only when you click the button.
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+  if (!gl) { document.body.innerHTML = "<p style='color:#fff;padding:16px'>WebGL not supported.</p>"; return; }
+
+  const showError = (msg) => {
+    let el = document.querySelector(".err");
+    if (!el) { el = document.createElement("div"); el.className = "err"; document.body.appendChild(el); }
+    el.textContent = msg;
+  };
+
+  // ---- Resize with render scale (perf win) ----
+  let renderScale = 0.75;
+  function resize() {
+    const dpr = Math.max(1, devicePixelRatio || 1);
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr * renderScale));
+    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr * renderScale));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  }
+  addEventListener("resize", resize);
+
+  // ---- Shaders ----
+  const MAX_SITES = 256;
+
+  const vsSrc = `
+    attribute vec3 aPos;
+    attribute vec3 aNor;
+
+    uniform mat4 uMVP;
+    uniform mat4 uModel;
+
+    varying vec3 vNorW;
+
+    void main() {
+      vNorW = normalize((uModel * vec4(aNor, 0.0)).xyz);
+      gl_Position = uMVP * vec4(aPos, 1.0);
+    }
+  `;
+
+  const fsSrc = `
+    precision mediump float;
+
+    varying vec3 vNorW;
+
+    uniform int uSiteCount;
+    uniform vec3 uSites[${MAX_SITES}];
+    uniform float uShowEdges;
+    uniform float uEdgeWidth;
+
+    vec3 palette(float t) {
+      return 0.55 + 0.45*cos(6.28318*(vec3(0.0, 0.33, 0.67) + t));
+    }
+
+    void main() {
+      vec3 dir = normalize(vNorW);
+
+      float best = -2.0;
+      float second = -2.0;
+      float bestIdxF = 0.0;
+
+      float countF = max(float(uSiteCount), 1.0);
+
+      for (int i=0; i<${MAX_SITES}; i++) {
+        float iF = float(i);
+        float active = step(iF + 0.5, countF);
+
+        vec3 s = normalize(uSites[i]);
+        float d = dot(dir, s);
+        d = mix(-2.0, d, active);
+
+        if (d > best) { second = best; best = d; bestIdxF = iF; }
+        else if (d > second) { second = d; }
+      }
+
+      float t = bestIdxF / max(countF - 1.0, 1.0);
+      vec3 col = palette(t);
+
+      // lighting
+      vec3 lightDir = normalize(vec3(-0.5, 0.8, 0.3));
+      float ndl = max(dot(dir, lightDir), 0.0);
+      col *= (0.25 + 0.75*ndl);
+
+      // thin edges
+      if (uShowEdges > 0.5) {
+        float gap = best - second;        // 0 at boundary
+        float w = max(uEdgeWidth, 0.0001);
+        float edge = smoothstep(w, 2.5*w, gap);
+        col = mix(vec3(0.02), col, edge);
+      }
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      throw new Error("Shader compile failed:\n" + (gl.getShaderInfoLog(sh) || "(no log)"));
+    }
+    return sh;
+  }
+
+  function link(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error("Program link failed:\n" + (gl.getProgramInfoLog(p) || "(no log)"));
+    }
+    return p;
+  }
+
+  let prog;
+  try {
+    prog = link(compile(gl.VERTEX_SHADER, vsSrc), compile(gl.FRAGMENT_SHADER, fsSrc));
+  } catch (e) {
+    showError(String(e));
+    console.error(e);
+    return;
+  }
+  gl.useProgram(prog);
+
+  // ---- Math helpers ----
+  const I4 = () => new Float32Array([1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1]);
+  const mul4 = (a,b) => {
+    const o = new Float32Array(16);
+    for (let c=0;c<4;c++) for (let r=0;r<4;r++) {
+      o[c*4+r] =
+        a[0*4+r]*b[c*4+0] +
+        a[1*4+r]*b[c*4+1] +
+        a[2*4+r]*b[c*4+2] +
+        a[3*4+r]*b[c*4+3];
+    }
+    return o;
+  };
+  const persp = (fovy, aspect, near, far) => {
+    const f = 1 / Math.tan(fovy/2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0,
+      0,f,0,0,
+      0,0,(far+near)*nf,-1,
+      0,0,(2*far*near)*nf,0
+    ]);
+  };
+  const sub3 = (ax,ay,az,bx,by,bz) => [ax-bx, ay-by, az-bz];
+  const dot3 = (ax,ay,az,bx,by,bz) => ax*bx + ay*by + az*bz;
+  const cross3 = (ax,ay,az,bx,by,bz) => [ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx];
+  const norm3 = (x,y,z) => { const l = Math.hypot(x,y,z) || 1; return [x/l,y/l,z/l]; };
+
+  // Proper lookAt (view matrix)
+  function lookAt(eye, target, up) {
+    const [ex,ey,ez] = eye, [tx,ty,tz] = target;
+    let [ux,uy,uz] = up;
+
+    let [fx,fy,fz] = norm3(tx-ex, ty-ey, tz-ez);             // forward
+    let [sx,sy,sz] = norm3(...cross3(fx,fy,fz, ux,uy,uz));   // right
+    let [ux2,uy2,uz2] = cross3(sx,sy,sz, fx,fy,fz);          // corrected up
+
+    // Column-major
+    return new Float32Array([
+      sx,  ux2, -fx, 0,
+      sy,  uy2, -fy, 0,
+      sz,  uz2, -fz, 0,
+      -dot3(sx,sy,sz, ex,ey,ez),
+      -dot3(ux2,uy2,uz2, ex,ey,ez),
+       dot3(fx,fy,fz, ex,ey,ez),
+      1
+    ]);
+  }
+
+  // Model rotation only (spin for life)
+  const rotX = (a) => { const c=Math.cos(a), s=Math.sin(a);
+    return new Float32Array([1,0,0,0,  0,c,s,0,  0,-s,c,0,  0,0,0,1]);
+  };
+  const rotY = (a) => { const c=Math.cos(a), s=Math.sin(a);
+    return new Float32Array([c,0,-s,0,  0,1,0,0,  s,0,c,0,  0,0,0,1]);
+  };
+
+  // ---- Sphere mesh ----
+  function makeSphere(lat=48, lon=96, r=1) {
+    const pos=[], nor=[], idx=[];
+    for (let y=0; y<=lat; y++) {
+      const v = y / lat;
+      const th = v * Math.PI;
+      const st = Math.sin(th), ct = Math.cos(th);
+      for (let x=0; x<=lon; x++) {
+        const u = x / lon;
+        const ph = u * Math.PI * 2;
+        const sp = Math.sin(ph), cp = Math.cos(ph);
+        const nx = cp*st, ny = ct, nz = sp*st;
+        nor.push(nx,ny,nz);
+        pos.push(nx*r,ny*r,nz*r);
+      }
+    }
+    const row = lon + 1;
+    for (let y=0; y<lat; y++) for (let x=0; x<lon; x++) {
+      const a = y*row + x;
+      const b = a + row;
+      idx.push(a,b,a+1,  b,b+1,a+1);
+    }
+    return { pos: new Float32Array(pos), nor: new Float32Array(nor), idx: new Uint16Array(idx) };
+  }
+  const sphere = makeSphere();
+
+  function makeBuffer(target, data) {
+    const b = gl.createBuffer();
+    gl.bindBuffer(target, b);
+    gl.bufferData(target, data, gl.STATIC_DRAW);
+    return b;
+  }
+  const posB = makeBuffer(gl.ARRAY_BUFFER, sphere.pos);
+  const norB = makeBuffer(gl.ARRAY_BUFFER, sphere.nor);
+  const idxB = makeBuffer(gl.ELEMENT_ARRAY_BUFFER, sphere.idx);
+
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  const aNor = gl.getAttribLocation(prog, "aNor");
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, posB);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, norB);
+  gl.enableVertexAttribArray(aNor);
+  gl.vertexAttribPointer(aNor, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxB);
+
+  // ---- Uniforms ----
+  const uMVP = gl.getUniformLocation(prog, "uMVP");
+  const uModel = gl.getUniformLocation(prog, "uModel");
+  const uSiteCount = gl.getUniformLocation(prog, "uSiteCount");
+  const uSites = gl.getUniformLocation(prog, "uSites[0]");
+  const uShowEdges = gl.getUniformLocation(prog, "uShowEdges");
+  const uEdgeWidth = gl.getUniformLocation(prog, "uEdgeWidth");
+
+  // ---- Random sites + approximate Lloyd ----
+  function randomSites(n) {
+    const pts = new Float32Array(MAX_SITES * 3);
+    for (let i=0; i<n; i++) {
+      const u = Math.random(), v = Math.random();
+      const z = 1 - 2*u;
+      const t = 2*Math.PI*v;
+      const r = Math.sqrt(Math.max(0, 1 - z*z));
+      pts[i*3+0] = r*Math.cos(t);
+      pts[i*3+1] = z;
+      pts[i*3+2] = r*Math.sin(t);
+    }
+    return pts;
+  }
+
+  function lloydRelax(sites, nSites, iters, samples) {
+    if (iters <= 0) return sites;
+    let cur = new Float32Array(sites);
+    for (let iter=0; iter<iters; iter++) {
+      const acc = new Float32Array(nSites * 3);
+      const cnt = new Uint32Array(nSites);
+
+      for (let s=0; s<samples; s++) {
+        const u = Math.random(), v = Math.random();
+        const z = 1 - 2*u;
+        const t = 2*Math.PI*v;
+        const r = Math.sqrt(Math.max(0, 1 - z*z));
+        const px = r*Math.cos(t), py = z, pz = r*Math.sin(t);
+
+        let best = -9, bestI = 0;
+        for (let i=0; i<nSites; i++) {
+          const sx = cur[i*3+0], sy = cur[i*3+1], sz = cur[i*3+2];
+          const d = px*sx + py*sy + pz*sz;
+          if (d > best) { best = d; bestI = i; }
+        }
+
+        acc[bestI*3+0] += px;
+        acc[bestI*3+1] += py;
+        acc[bestI*3+2] += pz;
+        cnt[bestI] += 1;
+      }
+
+      const next = new Float32Array(cur);
+      for (let i=0; i<nSites; i++) {
+        if (cnt[i] === 0) continue;
+        const x = acc[i*3+0], y = acc[i*3+1], z = acc[i*3+2];
+        const [nx,ny,nz] = norm3(x,y,z);
+        next[i*3+0] = nx; next[i*3+1] = ny; next[i*3+2] = nz;
+      }
+      cur = next;
+    }
+    return cur;
+  }
+
+  let siteCount = 96;
+  let siteData = randomSites(siteCount);
+
+  function uploadSites() {
+    gl.uniform1i(uSiteCount, siteCount);
+    gl.uniform3fv(uSites, siteData);
+  }
+
+  // ---- UI ----
+  const nSlider = document.getElementById("n");
+  const nVal = document.getElementById("nVal");
+  const wSlider = document.getElementById("w");
+  const wVal = document.getElementById("wVal");
+  const sSlider = document.getElementById("scale");
+  const sVal = document.getElementById("sVal");
+  const lSlider = document.getElementById("lloyd");
+  const lVal = document.getElementById("lVal");
+  const regenBtn = document.getElementById("regen");
+  const edgesCb = document.getElementById("edges");
+
+  function setCount(n) {
+    siteCount = Math.min(MAX_SITES, Math.max(1, n|0));
+    nVal.textContent = String(siteCount);
+    nSlider.value = String(siteCount);
+    // do not auto-regenerate here; that’s button’s job
+    uploadSites();
+  }
+
+  function setWidth(w) {
+    const ww = Math.max(0.0005, Math.min(0.02, +w));
+    wVal.textContent = ww.toFixed(4);
+    wSlider.value = String(ww);
+    gl.uniform1f(uEdgeWidth, ww);
+  }
+
+  function setScale(s) {
+    renderScale = Math.max(0.35, Math.min(1.0, +s));
+    sVal.textContent = renderScale.toFixed(2);
+    sSlider.value = String(renderScale);
+    resize();
+  }
+
+  function setLloydIters(k) {
+    const kk = Math.max(0, Math.min(12, k|0));
+    lVal.textContent = String(kk);
+    lSlider.value = String(kk);
+  }
+
+  function randomizeAndRelax() {
+    const iters = +lSlider.value | 0;
+    const samples = Math.min(24000, Math.max(5000, siteCount * 130));
+    siteData = randomSites(siteCount);
+    if (iters > 0) siteData = lloydRelax(siteData, siteCount, iters, samples);
+    uploadSites();
+  }
+
+  nSlider.addEventListener("input", () => setCount(+nSlider.value));
+  wSlider.addEventListener("input", () => setWidth(+wSlider.value));
+  sSlider.addEventListener("input", () => setScale(+sSlider.value));
+  lSlider.addEventListener("input", () => setLloydIters(+lSlider.value));
+  regenBtn.addEventListener("click", randomizeAndRelax);
+  edgesCb.addEventListener("change", () => gl.uniform1f(uShowEdges, edgesCb.checked ? 1 : 0));
+
+  gl.uniform1f(uShowEdges, 1);
+  setWidth(+wSlider.value);
+  setScale(+sSlider.value);
+  setLloydIters(+lSlider.value);
+  randomizeAndRelax();
+
+  // ---- Orbit camera controls (THIS is what you were missing) ----
+  // yaw around Y, pitch around X, distance
+  let yaw = 0.9;
+  let pitch = 0.35;
+  let dist = 3.2;
+
+  let dragging=false, lx=0, ly=0;
+  canvas.addEventListener("mousedown", e => { dragging=true; lx=e.clientX; ly=e.clientY; });
+  addEventListener("mouseup", () => dragging=false);
+  addEventListener("mousemove", e => {
+    if (!dragging) return;
+    const dx = e.clientX - lx;
+    const dy = e.clientY - ly;
+    lx = e.clientX; ly = e.clientY;
+
+    yaw   += dx * 0.005;
+    pitch += dy * 0.005;
+    pitch = Math.max(-1.45, Math.min(1.45, pitch));
+  });
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    dist *= (e.deltaY > 0) ? 1.10 : 0.91;
+    dist = Math.max(1.8, Math.min(10.0, dist));
+  }, { passive:false });
+
+  function orbitEye(yaw, pitch, dist) {
+    // spherical coords around origin
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const cy = Math.cos(yaw),   sy = Math.sin(yaw);
+    const x = dist * (cp * sy);
+    const y = dist * (sp);
+    const z = dist * (cp * cy);
+    return [x,y,z];
+  }
+
+  // ---- GL state ----
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.cullFace(gl.BACK);
+
+  // ---- Render loop ----
+  function frame(t) {
+    resize();
+    gl.clearColor(0.03,0.04,0.06,1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const aspect = canvas.width / canvas.height;
+    const P = persp(60*Math.PI/180, aspect, 0.1, 100.0);
+
+    const eye = orbitEye(yaw, pitch, dist);
+    const V = lookAt(eye, [0,0,0], [0,1,0]);
+
+    // slight model spin so it doesn't feel dead
+    const spin = t * 0.00015;
+    const M = mul4(rotY(spin), I4());
+    const MVP = mul4(P, mul4(V, M));
+
+    gl.uniformMatrix4fv(uMVP, false, MVP);
+    gl.uniformMatrix4fv(uModel, false, M);
+
+    gl.drawElements(gl.TRIANGLES, sphere.idx.length, gl.UNSIGNED_SHORT, 0);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
